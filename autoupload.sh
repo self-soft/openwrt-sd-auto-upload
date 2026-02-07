@@ -1,0 +1,237 @@
+#!/bin/sh
+# OpenWrt SD watchdog for “dumb” USB SD readers that never report removal
+
+SCRIPTDIR="$(dirname "$0")"
+CONFIG="$SCRIPTDIR/autoupload.conf"
+if [ ! -f "$CONFIG" ]; then
+  echo "Missing config: $CONFIG"
+  exit 1
+fi
+. "$CONFIG"
+
+
+log() { logger -t "$TAG" "$*"; }
+
+have_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+notify() {
+  [ -x "$TELEGRAM" ] || return 0
+  [ "$#" -gt 0 ] || return 0
+  "$TELEGRAM" "$*"
+}
+
+notify_upload_start() {
+  [ -x "$TELEGRAM" ] || return 0
+  size="$(du -hs "$SDPATH" 2>/dev/null)"
+  if [ -z "$size" ]; then
+    size="(size unavailable)"
+  fi
+  if cd "$SDPATH" 2>/dev/null; then
+    files="$(ls -lRh 2>/dev/null)"
+  else
+    files="(unable to list files)"
+  fi
+  msg="upload started: $UPLOAD_ID
+size:
+$size
+files:
+$files"
+  notify "$msg"
+}
+
+media_present() {
+  if [ -e "/sys/block/$BLOCK/size" ]; then
+    size="$(cat "/sys/block/$BLOCK/size" 2>/dev/null)"
+    case "$size" in
+      ""|*[!0-9]*) ;;
+      *)
+        [ "$size" -gt 0 ] && return 0
+        ;;
+    esac
+  fi
+  [ -b "$DEV" ] && return 0
+  return 1
+}
+
+is_mounted() {
+  # BusyBox mountpoint may or may not exist; parse /proc/mounts instead
+  grep -q " $SDPATH " /proc/mounts
+}
+
+try_mount() {
+  [ -d "$SDPATH" ] || mkdir -p "$SDPATH"
+  if is_mounted; then
+    return 0
+  fi
+  # Try to mount; ignore error noise
+  mount -o "$MOUNT_OPTS" "$DEV" "$SDPATH" 2>/dev/null && return 0
+  return 1
+}
+
+safe_umount() {
+  if is_mounted; then
+    sync
+    umount "$SDPATH" 2>/dev/null || true
+  fi
+}
+
+reset_storage_soft() {
+  # Least disruptive: remove the SCSI block device so it can be rediscovered
+  if [ -e "/sys/block/$BLOCK/device/delete" ]; then
+    log "Soft reset: deleting block device /sys/block/$BLOCK"
+    echo 1 > "/sys/block/$BLOCK/device/delete"
+    return 0
+  fi
+  return 1
+}
+
+reset_usb_hard() {
+  # More disruptive but reliable: reset only the reader USB function (USBID)
+  if [ -e "/sys/bus/usb/drivers/usb/unbind" ] && [ -e "/sys/bus/usb/drivers/usb/bind" ]; then
+    log "Hard reset: unbind/bind USB device $USBID"
+    echo "$USBID" > /sys/bus/usb/drivers/usb/unbind
+    sleep 1
+    echo "$USBID" > /sys/bus/usb/drivers/usb/bind
+    return 0
+  fi
+  return 1
+}
+
+reset_reader() {
+  # Always unmount first to avoid corruption
+  safe_umount
+
+  # Prefer soft reset; fall back to USB unbind/bind
+  reset_storage_soft || reset_usb_hard
+}
+
+flag_present() {
+  [ -f "$SDPATH/$FLAGFILE" ]
+}
+
+has_payload() {
+  for entry in "$SDPATH"/* "$SDPATH"/.*; do
+    [ -e "$entry" ] || continue
+    base="$(basename "$entry")"
+    [ "$base" = "." ] && continue
+    [ "$base" = ".." ] && continue
+    [ "$base" = "$FLAGFILE" ] && continue
+    [ "$base" = "uploadid.txt" ] && continue
+    return 0
+  done
+  return 1
+}
+
+cleanup_sd() {
+  find "$SDPATH" -mindepth 1 -maxdepth 1 ! -name "$FLAGFILE" -exec rm -rf {} \; 2>/dev/null
+  sync
+}
+
+upload() {
+  # Placeholder: customize to your needs.
+  # Example: rsync SD content to remote host or local dir.
+  #
+  # REQUIREMENTS: opkg install rsync
+  #
+  # Example variables:
+  SRC="$SDPATH/"
+  RSYNC_OPTS="-a --partial --inplace"
+
+  if ! have_cmd rsync; then
+    log "rsync not installed; skipping upload"
+    notify "upload error: rsync not installed"
+    return 1
+  fi
+
+  UPLOAD_ID="$(date +"%Y%m%d%H%M%S")"
+  echo "$UPLOAD_ID" > "$SDPATH/uploadid.txt"
+
+  DST_TARGET="$DST/$UPLOAD_ID/"
+  log "Starting upload via rsync: $SRC -> $DST_TARGET"
+  notify_upload_start
+  rsync -e "$SSH_COMMAND" $RSYNC_OPTS "$SRC" "$DST_TARGET"
+  rc=$?
+  log "Upload finished with rc=$rc"
+  if [ "$rc" -eq 0 ]; then
+    cleanup_sd
+    safe_umount
+    notify "upload finished: $UPLOAD_ID"
+  else
+    notify "upload error: $UPLOAD_ID rc=$rc"
+  fi
+  return $rc
+}
+
+main_loop() {
+  log "Starting watchdog: SDPATH=$SDPATH FLAGFILE=$FLAGFILE USBID=$USBID INTERVAL=${INTERVAL}s"
+
+  LAST_STATE=""
+  FSCK_DONE=0
+  while true; do
+    if ! media_present; then
+      if [ "$LAST_STATE" != "no-media" ]; then
+        log "No SD media present; waiting"
+        LAST_STATE="no-media"
+        FSCK_DONE=0
+      fi
+      sleep "$INTERVAL"
+      continue
+    fi
+
+    if ! is_mounted; then
+      if [ "$FSCK_DONE" -eq 0 ]; then
+        if have_cmd fsck.exfat && [ -b "$DEV" ]; then
+          log "Running fsck.exfat on $DEV"
+          fsck.exfat "$DEV" --repair-auto >/dev/null 2>&1 || log "fsck.exfat returned rc=$?"
+        else
+          log "fsck.exfat not available; skipping"
+        fi
+        FSCK_DONE=1
+      fi
+      try_mount >/dev/null 2>&1 || true
+    fi
+
+    if ! is_mounted; then
+      if [ "$LAST_STATE" != "not-mounted" ]; then
+        log "Media present but not mounted; will retry"
+        LAST_STATE="not-mounted"
+      fi
+      sleep "$INTERVAL"
+      continue
+    fi
+
+    if [ "$LAST_STATE" != "mounted" ]; then
+      log "Media mounted at $SDPATH"
+      LAST_STATE="mounted"
+    fi
+
+    if flag_present; then
+      log "Flag present: $SDPATH/$FLAGFILE"
+      if has_payload; then
+        upload || true
+      else
+        log "No payload files; skipping upload"
+      fi
+    else
+      log "Flag missing: $SDPATH/$FLAGFILE -> resetting reader"
+      reset_reader
+      # Give kernel time to re-enumerate
+      sleep 3
+      # Try to mount again right away (optional)
+      try_mount >/dev/null 2>&1 || true
+    fi
+
+    safe_umount
+
+    sleep "$INTERVAL"
+  done
+}
+
+# Locking
+( set -o noclobber; echo "$$" > "$LOCK" ) 2>/dev/null || {
+  echo "Already running (lock $LOCK exists)"; exit 1;
+}
+trap 'rm -f "$LOCK"' EXIT
+trap 'rm -f "$LOCK"; exit 130' INT TERM
+
+main_loop

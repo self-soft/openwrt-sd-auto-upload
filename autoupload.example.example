@@ -1,0 +1,23 @@
+SDPATH="/mnt/SD_Card"
+FLAGFILE="openwrt-sd-auto-upload"
+
+# Your SD reader USB node (from /sys/bus/usb/devices/*)
+USBID="1-1.1"
+
+# Poll interval (seconds)
+INTERVAL=60
+
+# Device nodes (adjust if your card shows up differently)
+DEV="/dev/sda1"
+BLOCK="sda"
+MOUNT_OPTS="rw,noatime"
+
+# Logging tag
+TAG="sd-watchdog"
+
+# Simple lock to avoid double-running
+LOCK="/var/run/sd-watchdog.lock"
+
+SSH_COMMAND="ssh -i $SCRIPTDIR/uploadkey_ed25519"
+DST="sd-auto-upload1@example.com:in"
+TELEGRAM="/root/bot/telegram.sh"
