@@ -14,6 +14,31 @@ log() { logger -t "$TAG" "$*"; }
 
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
+start_log_monitor() {
+  LOGMON_PID=""
+  LOGMON_FLAG=""
+  have_cmd logread || return 0
+  LOGMON_FLAG="/tmp/sd-watchdog-err.$$"
+  : > "$LOGMON_FLAG"
+  logread -f 2>/dev/null | while IFS= read -r line; do
+    case "$line" in
+      *"access beyond end of device"*"$BLOCK"*|*"I/O error, dev $BLOCK"*|*"blk_update_request: I/O error, dev $BLOCK"*)
+        echo 1 > "$LOGMON_FLAG"
+        ;;
+    esac
+  done &
+  LOGMON_PID=$!
+}
+
+stop_log_monitor() {
+  [ -n "$LOGMON_PID" ] && kill "$LOGMON_PID" 2>/dev/null || true
+  [ -n "$LOGMON_FLAG" ] && rm -f "$LOGMON_FLAG"
+}
+
+log_error_seen() {
+  [ -n "$LOGMON_FLAG" ] && [ -s "$LOGMON_FLAG" ]
+}
+
 dst_host() {
   host="$DST"
   host="${host#*@}"
@@ -163,7 +188,7 @@ upload() {
   #
   # Example variables:
   SRC="$SDPATH/"
-  RSYNC_OPTS="-a --partial --inplace"
+  RSYNC_OPTS="-a --inplace --partial --checksum"
 
   if ! have_cmd rsync; then
     log "rsync not installed; skipping upload"
@@ -189,13 +214,41 @@ upload() {
   DST_TARGET="$DST/$UPLOAD_ID/"
   log "Starting upload via rsync: $SRC -> $DST_TARGET"
   notify_upload_start
-  rsync -e "$SSH_COMMAND" $RSYNC_OPTS "$SRC" "$DST_TARGET"
+  start_log_monitor
+  UPLOAD_ABORTED=0
+  rsync -e "$SSH_COMMAND" $RSYNC_OPTS "$SRC" "$DST_TARGET" &
+  rsync_pid=$!
+  while kill -0 "$rsync_pid" 2>/dev/null; do
+    if log_error_seen; then
+      log "Kernel I/O errors detected; stopping rsync"
+      notify "upload error: media I/O error"
+      UPLOAD_ABORTED=1
+      kill "$rsync_pid" 2>/dev/null || true
+      sleep 1
+      kill -9 "$rsync_pid" 2>/dev/null || true
+      break
+    fi
+    if ! media_present || ! is_mounted || ! ls "$SDPATH" >/dev/null 2>&1; then
+      log "Media not accessible during upload; stopping rsync"
+      notify "upload error: media removed"
+      UPLOAD_ABORTED=1
+      kill "$rsync_pid" 2>/dev/null || true
+      sleep 1
+      kill -9 "$rsync_pid" 2>/dev/null || true
+      break
+    fi
+    sleep 1
+  done
+  wait "$rsync_pid"
   rc=$?
+  stop_log_monitor
   log "Upload finished with rc=$rc"
   if [ "$rc" -eq 0 ]; then
     cleanup_sd
     safe_umount
     notify "upload finished: $UPLOAD_ID"
+  elif [ "$UPLOAD_ABORTED" -eq 1 ]; then
+    log "Upload aborted due to media removal"
   else
     notify "upload error: $UPLOAD_ID rc=$rc"
   fi
