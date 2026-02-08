@@ -400,7 +400,8 @@ main_loop() {
       if has_payload; then
         upload || true
       else
-        log "No payload files; skipping upload"
+        log "No payload files; resetting reader to refresh contents"
+        reset_reader
       fi
     else
       log "Flag missing: $SDPATH/$FLAGFILE -> resetting reader"
