@@ -9,10 +9,71 @@ if [ ! -f "$CONFIG" ]; then
 fi
 . "$CONFIG"
 
+: "${NO_MEDIA_RESET_INTERVAL:=5}"
 
 log() { logger -t "$TAG" "$*"; }
 
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+send_rsync_stats() {
+  [ -x "$TELEGRAM" ] || return 0
+  [ -f "$1" ] || return 0
+  stats="$(sed -n '/^Number of files/,$p' "$1" 2>/dev/null)"
+  [ -n "$stats" ] || return 0
+  tg_dir="$(dirname "$TELEGRAM")"
+  if [ -d "$tg_dir" ]; then
+    (cd "$tg_dir" 2>/dev/null && printf '%s\n' "$stats" | "$TELEGRAM" -C -) || printf '%s\n' "$stats" | "$TELEGRAM" -C -
+  else
+    printf '%s\n' "$stats" | "$TELEGRAM" -C -
+  fi
+}
+
+block_from_dev() {
+  devpath="$1"
+  if have_cmd readlink; then
+    devpath="$(readlink -f "$1" 2>/dev/null || echo "$1")"
+  fi
+  devbase="$(basename "$devpath")"
+  case "$devbase" in
+    *p[0-9]*)
+      echo "$devbase" | sed 's/p[0-9]\+$//'
+      ;;
+    *[0-9])
+      echo "$devbase" | sed 's/[0-9]\+$//'
+      ;;
+    *)
+      echo "$devbase"
+      ;;
+  esac
+}
+
+resolve_dev() {
+  new_dev=""
+  if [ -n "$SD_LABEL" ]; then
+    if [ -e "/dev/disk/by-label/$SD_LABEL" ] && [ -b "/dev/disk/by-label/$SD_LABEL" ]; then
+      new_dev="/dev/disk/by-label/$SD_LABEL"
+    elif have_cmd block; then
+      dev_line="$(block info 2>/dev/null | grep -F -m1 "LABEL=\"$SD_LABEL\"")"
+      [ -n "$dev_line" ] && new_dev="${dev_line%%:*}"
+    fi
+  elif [ -n "$SD_UUID" ]; then
+    if [ -e "/dev/disk/by-uuid/$SD_UUID" ] && [ -b "/dev/disk/by-uuid/$SD_UUID" ]; then
+      new_dev="/dev/disk/by-uuid/$SD_UUID"
+    elif have_cmd block; then
+      dev_line="$(block info 2>/dev/null | grep -F -m1 "UUID=\"$SD_UUID\"")"
+      [ -n "$dev_line" ] && new_dev="${dev_line%%:*}"
+    fi
+  fi
+  if [ -z "$new_dev" ]; then
+    new_dev="$DEV"
+  fi
+  if [ -n "$new_dev" ] && [ "$new_dev" != "$DEV" ] && [ -e "$new_dev" ]; then
+    DEV="$new_dev"
+    BLOCK="$(block_from_dev "$DEV")"
+    log "Detected SD device: $DEV (block $BLOCK)"
+    FSCK_DONE=0
+  fi
+}
 
 start_log_monitor() {
   LOGMON_PID=""
@@ -188,7 +249,7 @@ upload() {
   #
   # Example variables:
   SRC="$SDPATH/"
-  RSYNC_OPTS="-a --inplace --partial --checksum"
+  RSYNC_OPTS="-a --inplace --partial --checksum --stats"
 
   if ! have_cmd rsync; then
     log "rsync not installed; skipping upload"
@@ -216,7 +277,9 @@ upload() {
   notify_upload_start
   start_log_monitor
   UPLOAD_ABORTED=0
-  rsync -e "$SSH_COMMAND" $RSYNC_OPTS "$SRC" "$DST_TARGET" &
+  RSYNC_LOG="/tmp/rsync.$$.log"
+  : > "$RSYNC_LOG"
+  rsync -e "$SSH_COMMAND" $RSYNC_OPTS "$SRC" "$DST_TARGET" >"$RSYNC_LOG" 2>&1 &
   rsync_pid=$!
   while kill -0 "$rsync_pid" 2>/dev/null; do
     if log_error_seen; then
@@ -244,6 +307,7 @@ upload() {
   stop_log_monitor
   log "Upload finished with rc=$rc"
   if [ "$rc" -eq 0 ]; then
+    send_rsync_stats "$RSYNC_LOG"
     cleanup_sd
     safe_umount
     notify "upload finished: $UPLOAD_ID"
@@ -252,6 +316,7 @@ upload() {
   else
     notify "upload error: $UPLOAD_ID rc=$rc"
   fi
+  rm -f "$RSYNC_LOG"
   return $rc
 }
 
@@ -262,8 +327,11 @@ main_loop() {
   FSCK_DONE=0
   PING_STATE=""
   ONLINE_NOTIFIED=0
+  NO_MEDIA_COUNT=0
 
   while true; do
+    resolve_dev
+
     if ping_host; then
       if [ "$PING_STATE" != "ok" ]; then
         log "Ping ok to $(dst_host)"
@@ -287,6 +355,13 @@ main_loop() {
         log "No SD media present; waiting"
         LAST_STATE="no-media"
         FSCK_DONE=0
+        NO_MEDIA_COUNT=0
+      fi
+      NO_MEDIA_COUNT=$((NO_MEDIA_COUNT + 1))
+      if [ "$NO_MEDIA_RESET_INTERVAL" -gt 0 ] && [ "$NO_MEDIA_COUNT" -ge "$NO_MEDIA_RESET_INTERVAL" ]; then
+        log "No media for ${NO_MEDIA_RESET_INTERVAL} checks; resetting reader"
+        reset_reader
+        NO_MEDIA_COUNT=0
       fi
       sleep "$INTERVAL"
       continue
@@ -310,6 +385,7 @@ main_loop() {
         log "Media present but not mounted; will retry"
         LAST_STATE="not-mounted"
       fi
+      reset_reader
       sleep "$INTERVAL"
       continue
     fi
