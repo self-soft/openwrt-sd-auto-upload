@@ -1,7 +1,7 @@
 #!/bin/sh
 # OpenWrt SD watchdog for “dumb” USB SD readers that never report removal
 
-SCRIPTDIR="$(dirname "$0")"
+SCRIPTDIR="$(cd "$(dirname "$0")" && pwd)"
 CONFIG="$SCRIPTDIR/autoupload.conf"
 if [ ! -f "$CONFIG" ]; then
   echo "Missing config: $CONFIG"
@@ -14,10 +14,34 @@ log() { logger -t "$TAG" "$*"; }
 
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
+dst_host() {
+  host="$DST"
+  host="${host#*@}"
+  host="${host%%:*}"
+  echo "$host"
+}
+
+ping_host() {
+  host="$(dst_host)"
+  [ -n "$host" ] || return 1
+  have_cmd ping || return 1
+  ping -c 1 -W 1 "$host" >/dev/null 2>&1
+}
+
 notify() {
   [ -x "$TELEGRAM" ] || return 0
   [ "$#" -gt 0 ] || return 0
-  "$TELEGRAM" "$*"
+  if [ "$#" -eq 1 ]; then
+    msg="$1"
+  else
+    msg="$*"
+  fi
+  tg_dir="$(dirname "$TELEGRAM")"
+  if [ -d "$tg_dir" ]; then
+    (cd "$tg_dir" 2>/dev/null && "$TELEGRAM" "$msg") || "$TELEGRAM" "$msg"
+  else
+    "$TELEGRAM" "$msg"
+  fi
 }
 
 notify_upload_start() {
@@ -27,11 +51,15 @@ notify_upload_start() {
     size="(size unavailable)"
   fi
   if cd "$SDPATH" 2>/dev/null; then
-    files="$(ls -lRh 2>/dev/null)"
+    files="$(ls -lR 2>/dev/null)"
   else
     files="(unable to list files)"
   fi
-  msg="upload started: $UPLOAD_ID
+  status="upload started"
+  if [ "$UPLOAD_RESUME" -eq 1 ]; then
+    status="upload resumed"
+  fi
+  msg="$status: $UPLOAD_ID
 size:
 $size
 files:
@@ -143,8 +171,20 @@ upload() {
     return 1
   fi
 
-  UPLOAD_ID="$(date +"%Y%m%d%H%M%S")"
-  echo "$UPLOAD_ID" > "$SDPATH/uploadid.txt"
+  UPLOAD_RESUME=0
+  if [ -f "$SDPATH/uploadid.txt" ]; then
+    prev_id="$(cat "$SDPATH/uploadid.txt" 2>/dev/null | tr -d '\r\n')"
+    case "$prev_id" in
+      [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9])
+        UPLOAD_ID="$prev_id"
+        UPLOAD_RESUME=1
+        ;;
+    esac
+  fi
+  if [ -z "$UPLOAD_ID" ]; then
+    UPLOAD_ID="$(date +"%Y%m%d%H%M%S")"
+    echo "$UPLOAD_ID" > "$SDPATH/uploadid.txt"
+  fi
 
   DST_TARGET="$DST/$UPLOAD_ID/"
   log "Starting upload via rsync: $SRC -> $DST_TARGET"
@@ -167,7 +207,28 @@ main_loop() {
 
   LAST_STATE=""
   FSCK_DONE=0
+  PING_STATE=""
+  ONLINE_NOTIFIED=0
+
   while true; do
+    if ping_host; then
+      if [ "$PING_STATE" != "ok" ]; then
+        log "Ping ok to $(dst_host)"
+        PING_STATE="ok"
+      fi
+      if [ "$ONLINE_NOTIFIED" -eq 0 ]; then
+        notify "system is online"
+        ONLINE_NOTIFIED=1
+      fi
+    else
+      if [ "$PING_STATE" != "fail" ]; then
+        log "Ping failed to $(dst_host); waiting"
+        PING_STATE="fail"
+      fi
+      sleep "$INTERVAL"
+      continue
+    fi
+
     if ! media_present; then
       if [ "$LAST_STATE" != "no-media" ]; then
         log "No SD media present; waiting"
