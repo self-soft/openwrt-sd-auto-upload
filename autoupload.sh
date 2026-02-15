@@ -49,14 +49,19 @@ block_from_dev() {
 
 resolve_dev() {
   new_dev=""
-  if [ -n "$SD_LABEL" ]; then
+  if have_cmd block; then
+    dev_line="$(block info 2>/dev/null | grep -F -m1 " MOUNT=\"$SDPATH\"")"
+    [ -n "$dev_line" ] && new_dev="${dev_line%%:*}"
+  fi
+  if [ -z "$new_dev" ] && [ -n "$SD_LABEL" ]; then
     if [ -e "/dev/disk/by-label/$SD_LABEL" ] && [ -b "/dev/disk/by-label/$SD_LABEL" ]; then
       new_dev="/dev/disk/by-label/$SD_LABEL"
     elif have_cmd block; then
       dev_line="$(block info 2>/dev/null | grep -F -m1 "LABEL=\"$SD_LABEL\"")"
       [ -n "$dev_line" ] && new_dev="${dev_line%%:*}"
     fi
-  elif [ -n "$SD_UUID" ]; then
+  fi
+  if [ -z "$new_dev" ] && [ -n "$SD_UUID" ]; then
     if [ -e "/dev/disk/by-uuid/$SD_UUID" ] && [ -b "/dev/disk/by-uuid/$SD_UUID" ]; then
       new_dev="/dev/disk/by-uuid/$SD_UUID"
     elif have_cmd block; then
@@ -330,6 +335,8 @@ main_loop() {
   NO_MEDIA_COUNT=0
 
   while true; do
+    reset_reader
+    sleep 45
     resolve_dev
 
     if ping_host; then
@@ -346,6 +353,7 @@ main_loop() {
         log "Ping failed to $(dst_host); waiting"
         PING_STATE="fail"
       fi
+      log "State: ping=fail media=unknown mounted=no"
       sleep "$INTERVAL"
       continue
     fi
@@ -363,6 +371,7 @@ main_loop() {
         reset_reader
         NO_MEDIA_COUNT=0
       fi
+      log "State: ping=ok media=no mounted=no"
       sleep "$INTERVAL"
       continue
     fi
@@ -386,6 +395,7 @@ main_loop() {
         LAST_STATE="not-mounted"
       fi
       reset_reader
+      log "State: ping=ok media=yes mounted=no"
       sleep "$INTERVAL"
       continue
     fi
@@ -413,6 +423,7 @@ main_loop() {
     fi
 
     safe_umount
+    log "State: ping=ok media=yes mounted=yes"
 
     sleep "$INTERVAL"
   done
